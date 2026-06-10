@@ -1,0 +1,18 @@
+# Market data backend dependencies
+
+# Yahoo Finance (free, no API key needed)
+yfinance>=0.2.36
+
+# HTTP client for REST API providers (Alpha Vantage, Polygon, Finnhub)
+requests>=2.31.0
+
+# Optional: faster JSON parsing
+# ujson>=5.8.0
+
+# Optional: async support
+# aiohttp>=3.9.0
+# asyncio
+
+# Development / testing
+# pytest>=7.4.0
+# pytest-cov>=4.1.0

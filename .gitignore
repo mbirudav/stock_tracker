@@ -1,0 +1,10 @@
+# Environment variables — never commit secrets
+.env
+.env.local
+
+# SQLite runtime database (created at runtime, persisted via Docker volume)
+db/finally.db
+
+# Python bytecode cache
+__pycache__/
+*.pyc

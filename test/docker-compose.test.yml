@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  finally:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      # Host port 8001 -> container 8000 (host 8000 may be in use by other apps)
+      - "8001:8000"
+    volumes:
+      - ./test-db:/app/db
+    environment:
+      - LLM_MOCK=true
+      - OPENROUTER_API_KEY=test-key-not-needed-in-mock-mode

@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  finally:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./test-db:/app/db
+    environment:
+      - LLM_MOCK=true
+      - OPENROUTER_API_KEY=test-key-not-needed-in-mock-mode

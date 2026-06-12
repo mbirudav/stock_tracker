@@ -1,0 +1,27 @@
+# Virtual environments — must not clobber the venv built inside the image
+**/.venv
+**/venv
+
+# Python caches
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+
+# Node build artifacts — rebuilt inside the image
+frontend/node_modules
+frontend/.next
+frontend/out
+
+# Runtime data — provided via volume mount, never baked into the image
+db/*.db
+db/*.db-*
+
+# Secrets
+.env
+.env.local
+
+# VCS / tooling
+.git
+.claude
+planning
+test

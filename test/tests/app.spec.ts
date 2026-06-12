@@ -1,4 +1,5 @@
 import { test, expect, Page, Locator } from '@playwright/test';
+import { execSync } from 'node:child_process';
 
 /**
  * FinAlly E2E Test Suite — all 8 scenarios from PLAN.md §12.
@@ -175,9 +176,9 @@ test.describe('FinAlly E2E Suite', () => {
     // AAPL cell label rendered inside the treemap SVG
     await expect(heatmap.getByText('AAPL', { exact: true })).toBeVisible({ timeout: 10000 });
 
-    // The cell rect must carry a computed P&L color (rgb(...) from lerpColor)
-    const fill = await heatmap.locator('svg rect').first().getAttribute('fill');
-    expect(fill).toMatch(/^rgb\(/);
+    // A cell rect must carry a computed P&L color (rgb(...) from lerpColor).
+    // Recharts also renders an unfilled background rect, so select by fill.
+    await expect(heatmap.locator('svg rect[fill^="rgb("]').first()).toBeVisible({ timeout: 10000 });
   });
 
   /**
@@ -223,19 +224,20 @@ test.describe('FinAlly E2E Suite', () => {
 
   /**
    * 8. SSE resilience: disconnect and verify automatic reconnection.
-   * context.setOffline() severs the open EventSource connection (a
-   * page.route() abort would only affect NEW requests, not the live stream).
+   * Chromium's offline emulation does NOT sever already-established
+   * connections, so the open SSE stream survives setOffline(true) and the
+   * UI correctly stays "LIVE". The only honest way to break the stream is
+   * to restart the server container (fast: ~2s startup).
    */
-  test('8. SSE reconnection after network drop', async ({ page, context }) => {
+  test('8. SSE reconnection after server restart', async ({ page }) => {
     await page.goto('/');
     await waitForConnected(page);
 
-    // Drop the network: the EventSource errors out and the UI leaves "LIVE"
-    await context.setOffline(true);
-    await expect(page.getByText(/DISCONNECTED|RECONNECTING/)).toBeVisible({ timeout: 10000 });
+    // Kill the live SSE stream server-side: EventSource errors, UI leaves "LIVE"
+    execSync('docker restart test-finally-1', { stdio: 'ignore', timeout: 60000 });
+    await expect(page.getByText(/DISCONNECTED|RECONNECTING/)).toBeVisible({ timeout: 15000 });
 
-    // Restore the network: the hook retries every 3s and should reconnect
-    await context.setOffline(false);
+    // The hook retries every 3s and should reconnect once the server is back
     await waitForConnected(page);
   });
 });

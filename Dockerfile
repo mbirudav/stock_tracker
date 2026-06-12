@@ -30,5 +30,6 @@ RUN mkdir -p /app/db
 # Expose port
 EXPOSE 8000
 
-# Run
-CMD ["uv", "run", "--project", "backend", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run — invoke the venv's interpreter directly (bypasses `uv run`, which would
+# re-resolve and re-sync the entire environment on every container start)
+CMD ["/app/backend/.venv/bin/python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

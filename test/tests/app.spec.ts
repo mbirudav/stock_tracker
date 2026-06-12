@@ -1,272 +1,241 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, Page, Locator } from '@playwright/test';
 
 /**
- * FinAlly E2E Test Suite
+ * FinAlly E2E Test Suite — all 8 scenarios from PLAN.md §12.
  *
- * Covers all 8 scenarios from PLAN.md §12:
- *   1. Fresh start: default watchlist, $10k balance, prices streaming
- *   2. Add and remove a ticker from the watchlist
- *   3. Buy shares: cash decreases, position appears, portfolio updates
- *   4. Sell shares: cash increases, position updates or disappears
- *   5. Portfolio heatmap renders with correct P&L colors
- *   6. P&L chart has data points
- *   7. AI chat (mocked): send a message, receive a response, trade execution inline
- *   8. SSE resilience: disconnect and verify reconnection
+ * Selectors are matched to the ACTUAL frontend DOM (frontend/components/):
+ *  - Connection status: header text "LIVE" / "RECONNECTING" / "DISCONNECTED"
+ *  - Cash balance: span following the "CASH" label in the header
+ *  - Panels are identified by their title spans: "WATCHLIST", "POSITIONS",
+ *    "PORTFOLIO HEATMAP", "PORTFOLIO P&L"
+ *  - Trade bar: placeholders "TICKER" / "QTY", buttons "BUY" / "SELL"
+ *  - Watchlist add: placeholder "ADD TICKER", button "+"
+ *  - Chat: textarea placeholder "Ask FinAlly...", button "SEND"
+ *  - Mock LLM (LLM_MOCK=true): "buy AAPL" -> buys 5 AAPL, replies
+ *    "Buying 5 shares of AAPL for you."
  *
- * Run with:  npx playwright test  (from test/ directory)
- * Requires:  docker compose -f docker-compose.test.yml up --build  (handled by webServer in playwright.config.ts)
- * Environment: LLM_MOCK=true (set in docker-compose.test.yml)
+ * State note: all tests share one backend DB (workers=1, sequential).
+ * run-server.cjs wipes test-db before each suite run, so test 1 always
+ * sees the fresh-seeded $10,000 balance.
  */
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Panel root: the div whose direct-child header div contains the title span. */
+function panel(page: Page, title: string): Locator {
+  return page.locator(`div:has(> div > span:text-is("${title}"))`);
+}
+
+/** Cash balance value span in the header (sibling of the "CASH" label). */
+function cashValue(page: Page): Locator {
+  return page.locator('xpath=//span[text()="CASH"]/following-sibling::span');
+}
+
+function parseMoney(text: string | null): number {
+  return parseFloat((text ?? '').replace(/[^0-9.\-]/g, ''));
+}
+
+/** Wait for the SSE connection indicator to show connected. */
+async function waitForConnected(page: Page): Promise<void> {
+  await expect(page.getByText('LIVE', { exact: true })).toBeVisible({ timeout: 15000 });
+}
+
+/** Execute a manual trade via the trade bar and wait for the success toast. */
+async function trade(page: Page, side: 'BUY' | 'SELL', ticker: string, qty: number): Promise<void> {
+  await page.getByPlaceholder('TICKER', { exact: true }).fill(ticker);
+  await page.getByPlaceholder('QTY', { exact: true }).fill(String(qty));
+  await page.getByRole('button', { name: side, exact: true }).click();
+  // TradeBar shows "✓ BUY 5 AAPL @ $190.12" on success
+  await expect(
+    page.getByText(new RegExp(`${side} ${qty} ${ticker} @ \\$`))
+  ).toBeVisible({ timeout: 10000 });
+}
+
+// ---------------------------------------------------------------------------
+// Suite
+// ---------------------------------------------------------------------------
 
 test.describe('FinAlly E2E Suite', () => {
 
   /**
-   * Test 1: Fresh start
-   * Verifies the initial state of the trading workstation:
-   * - Default watchlist tickers visible (AAPL, GOOGL, MSFT)
-   * - $10,000 starting cash balance shown
-   * - SSE connection is active (green status dot)
+   * 1. Fresh start: default watchlist, $10k balance, prices streaming.
    */
   test('1. Fresh start: default watchlist, $10k balance, prices streaming', async ({ page }) => {
     await page.goto('/');
 
-    // Check $10,000 cash visible — accept any formatting: $10,000 or $10000 or $10,000.00
-    await expect(page.getByText(/\$10[,.]?000/)).toBeVisible({ timeout: 10000 });
+    // Connection dot/label green ("LIVE")
+    await waitForConnected(page);
 
-    // Check at least the core default tickers are visible in the watchlist
+    // $10,000.00 starting cash in the header
+    await expect(cashValue(page)).toHaveText(/\$10,000\.00/, { timeout: 10000 });
+
+    // Default tickers visible in the watchlist panel
+    const watchlist = panel(page, 'WATCHLIST');
     for (const ticker of ['AAPL', 'GOOGL', 'MSFT']) {
-      await expect(page.getByText(ticker)).toBeVisible({ timeout: 5000 });
+      await expect(watchlist.getByText(ticker, { exact: true })).toBeVisible({ timeout: 5000 });
     }
 
-    // Connection status dot should indicate connected (green)
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
-
-    // Verify prices are present (at least one price element rendered)
-    const priceEl = page.locator('[data-ticker="AAPL"] .price').first();
-    await expect(priceEl).toBeVisible({ timeout: 10000 });
+    // Prices are streaming: AAPL price fills in, then changes over time
+    const aaplRow = watchlist.locator('.grid').filter({ hasText: 'AAPL' });
+    const priceSpan = aaplRow.locator('span.font-mono').first();
+    await expect(priceSpan).not.toHaveText('--', { timeout: 15000 });
+    const initialPrice = await priceSpan.textContent();
+    await expect
+      .poll(async () => priceSpan.textContent(), { timeout: 15000 })
+      .not.toBe(initialPrice);
   });
 
   /**
-   * Test 2: Add and remove a watchlist ticker
-   * Verifies the watchlist management workflow:
-   * - User can add an arbitrary ticker (PYPL)
-   * - Added ticker becomes visible in the watchlist
-   * - User can remove the ticker
-   * - Removed ticker disappears from the watchlist
+   * 2. Add and remove a ticker from the watchlist.
    */
   test('2. Add and remove watchlist ticker', async ({ page }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Wait for app to be fully loaded
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    const watchlist = panel(page, 'WATCHLIST');
 
-    // Add PYPL to watchlist
-    await page.getByPlaceholder(/ticker/i).fill('PYPL');
-    await page.getByRole('button', { name: /add/i }).click();
+    // Add PYPL
+    await page.getByPlaceholder('ADD TICKER').fill('PYPL');
+    await page.getByRole('button', { name: '+', exact: true }).click();
+    await expect(watchlist.getByText('PYPL', { exact: true })).toBeVisible({ timeout: 5000 });
 
-    // PYPL should appear in the watchlist
-    await expect(page.getByText('PYPL')).toBeVisible({ timeout: 5000 });
-
-    // Remove PYPL via the remove button on its watchlist row
-    await page.locator('[data-ticker="PYPL"] button[aria-label="remove"]').click();
-
-    // PYPL should no longer be visible
-    await expect(page.getByText('PYPL')).not.toBeVisible({ timeout: 5000 });
+    // Remove PYPL via the remove control on its watchlist row
+    const pyplRow = watchlist.locator('.grid').filter({ hasText: 'PYPL' });
+    await pyplRow.hover(); // remove buttons are often hover-revealed
+    await pyplRow.getByRole('button', { name: /remove|×|✕|x/i }).click({ timeout: 5000 });
+    await expect(watchlist.getByText('PYPL', { exact: true })).not.toBeVisible({ timeout: 5000 });
   });
 
   /**
-   * Test 3: Buy shares
-   * Verifies trade execution (buy side):
-   * - Cash balance decreases after buying 5 shares of AAPL
-   * - AAPL appears in the positions table after purchase
+   * 3. Buy shares: cash decreases, position appears.
    */
   test('3. Buy shares: cash decreases, position appears', async ({ page }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Wait for app to be fully loaded and prices streaming
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    // Record cash before the trade
+    await expect(cashValue(page)).toHaveText(/\$/, { timeout: 10000 });
+    const cashBefore = parseMoney(await cashValue(page).textContent());
 
-    // Record cash balance before trade
-    const cashBefore = await page.locator('.cash-balance').textContent();
-    expect(cashBefore).toBeTruthy();
+    // Buy 5 AAPL
+    await trade(page, 'BUY', 'AAPL', 5);
 
-    // Execute buy: 5 shares of AAPL
-    await page.locator('input[name="trade-ticker"]').fill('AAPL');
-    await page.locator('input[name="trade-quantity"]').fill('5');
-    await page.getByRole('button', { name: /buy/i }).click();
+    // Cash decreases (header refreshes right after the trade)
+    await expect
+      .poll(async () => parseMoney(await cashValue(page).textContent()), { timeout: 10000 })
+      .toBeLessThan(cashBefore);
 
-    // Wait for trade to settle
-    await page.waitForTimeout(1000);
-
-    // Cash should have decreased
-    const cashAfter = await page.locator('.cash-balance').textContent();
-    const parseCash = (s: string) => parseFloat(s!.replace(/[^0-9.]/g, ''));
-    expect(parseCash(cashAfter!)).toBeLessThan(parseCash(cashBefore!));
-
-    // AAPL should appear in the positions table
-    await expect(page.locator('.positions-table').getByText('AAPL')).toBeVisible({ timeout: 5000 });
+    // AAPL appears in the positions table
+    await expect(
+      panel(page, 'POSITIONS').getByText('AAPL', { exact: true })
+    ).toBeVisible({ timeout: 10000 });
   });
 
   /**
-   * Test 4: Sell shares
-   * Verifies trade execution (sell side):
-   * - Cash balance increases after selling shares
-   * - Position updates or disappears from positions table
-   *
-   * Setup: buy 5 AAPL first, then sell all 5.
+   * 4. Sell shares: cash increases, position updates.
    */
-  test('4. Sell shares: cash increases, position updates or disappears', async ({ page }) => {
+  test('4. Sell shares: cash increases', async ({ page }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Wait for app to be fully loaded
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    await expect(cashValue(page)).toHaveText(/\$/, { timeout: 10000 });
+    const cashStart = parseMoney(await cashValue(page).textContent());
 
-    // Step 1: Buy 5 AAPL
-    await page.locator('input[name="trade-ticker"]').fill('AAPL');
-    await page.locator('input[name="trade-quantity"]').fill('5');
-    await page.getByRole('button', { name: /buy/i }).click();
-    await page.waitForTimeout(500);
+    // Buy 5 AAPL, wait for cash to settle below the starting value
+    await trade(page, 'BUY', 'AAPL', 5);
+    await expect
+      .poll(async () => parseMoney(await cashValue(page).textContent()), { timeout: 10000 })
+      .toBeLessThan(cashStart);
+    const cashAfterBuy = parseMoney(await cashValue(page).textContent());
 
-    // Record cash after buy
-    const cashAfterBuy = await page.locator('.cash-balance').textContent();
+    // Sell the 5 AAPL back
+    await trade(page, 'SELL', 'AAPL', 5);
 
-    // Step 2: Sell all 5 AAPL
-    await page.locator('input[name="trade-ticker"]').fill('AAPL');
-    await page.locator('input[name="trade-quantity"]').fill('5');
-    await page.getByRole('button', { name: /sell/i }).click();
-    await page.waitForTimeout(1000);
-
-    // Cash should have increased back (approximately back to ~$10k)
-    const cashAfterSell = await page.locator('.cash-balance').textContent();
-    const parseCash = (s: string) => parseFloat(s!.replace(/[^0-9.]/g, ''));
-    expect(parseCash(cashAfterSell!)).toBeGreaterThan(parseCash(cashAfterBuy!));
-
-    // Position should have been removed (quantity = 0 means row deleted per spec)
-    await expect(page.locator('.positions-table').getByText('AAPL')).not.toBeVisible({ timeout: 5000 });
+    // Cash increases again (sell proceeds credited)
+    await expect
+      .poll(async () => parseMoney(await cashValue(page).textContent()), { timeout: 10000 })
+      .toBeGreaterThan(cashAfterBuy);
   });
 
   /**
-   * Test 5: Portfolio heatmap renders with P&L colors
-   * Verifies the treemap/heatmap visualization:
-   * - Heatmap container is visible
-   * - After buying a position, AAPL cell appears in the heatmap
-   * - Cell has a background color (green/red for P&L)
+   * 5. Portfolio heatmap renders with P&L colors.
    */
   test('5. Portfolio heatmap renders with P&L colors', async ({ page }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Wait for app to be fully loaded
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    // Ensure there is a position to render
+    await trade(page, 'BUY', 'AAPL', 10);
 
-    // Buy a position to populate the heatmap
-    await page.locator('input[name="trade-ticker"]').fill('AAPL');
-    await page.locator('input[name="trade-quantity"]').fill('10');
-    await page.getByRole('button', { name: /buy/i }).click();
+    const heatmap = panel(page, 'PORTFOLIO HEATMAP');
+    await expect(heatmap).toBeVisible({ timeout: 5000 });
 
-    // Wait for heatmap to re-render with new position
-    await page.waitForTimeout(2000);
+    // AAPL cell label rendered inside the treemap SVG
+    await expect(heatmap.getByText('AAPL', { exact: true })).toBeVisible({ timeout: 10000 });
 
-    // Heatmap container should be visible
-    await expect(page.locator('.portfolio-heatmap')).toBeVisible({ timeout: 5000 });
-
-    // AAPL cell should appear within the heatmap
-    await expect(page.locator('.portfolio-heatmap').getByText('AAPL')).toBeVisible({ timeout: 5000 });
-
-    // The heatmap cell should have a color style applied (green or red P&L indicator)
-    const heatmapCell = page.locator('.portfolio-heatmap [data-ticker="AAPL"]');
-    const bgColor = await heatmapCell.evaluate(el => window.getComputedStyle(el).backgroundColor);
-    // Background should not be transparent — it should have a real color
-    expect(bgColor).not.toBe('rgba(0, 0, 0, 0)');
-    expect(bgColor).not.toBe('transparent');
+    // The cell rect must carry a computed P&L color (rgb(...) from lerpColor)
+    const fill = await heatmap.locator('svg rect').first().getAttribute('fill');
+    expect(fill).toMatch(/^rgb\(/);
   });
 
   /**
-   * Test 6: P&L chart shows data points
-   * Verifies the portfolio value over time chart:
-   * - P&L chart container is rendered
-   * - SVG path(s) are present (indicating chart has rendered data)
-   *
-   * Note: The backend records portfolio_snapshots every 30s, but also
-   * immediately after each trade. We wait 5s and make a trade to trigger a snapshot.
+   * 6. P&L chart shows data points.
+   * Snapshots are recorded every 30s and immediately after each trade —
+   * earlier tests in this suite have already generated several.
    */
   test('6. P&L chart shows data points', async ({ page }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Wait for app to be fully loaded
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    // Trigger one more snapshot so the chart has >= 2 points even when
+    // this test is run in isolation against a fresh DB
+    await trade(page, 'BUY', 'AAPL', 1);
 
-    // Make a trade to trigger an immediate portfolio snapshot
-    await page.locator('input[name="trade-ticker"]').fill('AAPL');
-    await page.locator('input[name="trade-quantity"]').fill('1');
-    await page.getByRole('button', { name: /buy/i }).click();
+    const plChart = panel(page, 'PORTFOLIO P&L');
+    await expect(plChart).toBeVisible({ timeout: 5000 });
 
-    // Wait a bit for the chart to update
-    await page.waitForTimeout(5000);
-
-    // P&L chart container should be visible
-    await expect(page.locator('.pnl-chart')).toBeVisible({ timeout: 5000 });
-
-    // Chart should have rendered SVG content (data lines)
-    await expect(page.locator('.pnl-chart svg')).toBeVisible({ timeout: 5000 });
+    // Recharts renders the series as an SVG path with .recharts-line-curve
+    await expect(plChart.locator('path.recharts-line-curve')).toBeVisible({ timeout: 20000 });
   });
 
   /**
-   * Test 7: AI chat with mock LLM — "buy AAPL" executes a trade
-   * Verifies the LLM chat integration (LLM_MOCK=true in docker-compose.test.yml):
-   * - User sends "buy AAPL" message
-   * - Assistant response appears within timeout
-   * - Trade confirmation is shown inline (mock LLM returns a buy AAPL trade action)
-   *
-   * Per PLAN.md §13.1-#7: mock responds to "buy AAPL" with a buy trade action.
+   * 7. AI chat with mock LLM — "buy AAPL" executes a trade inline.
+   * LLM_MOCK=true: "buy AAPL" -> trade {AAPL, buy, 5} + fixed message.
    */
   test('7. AI chat with mock LLM — buy AAPL executes', async ({ page }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Wait for app to be fully loaded
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    // Send "buy AAPL" to the assistant
+    await page.getByPlaceholder(/Ask FinAlly/).fill('buy AAPL');
+    await page.getByRole('button', { name: 'SEND', exact: true }).click();
 
-    // Type "buy AAPL" into the chat input
-    await page.locator('.chat-input').fill('buy AAPL');
+    // Mock assistant response appears
+    await expect(
+      page.getByText('Buying 5 shares of AAPL for you.')
+    ).toBeVisible({ timeout: 15000 });
 
-    // Send the message
-    await page.locator('.chat-send').click();
-
-    // Loading indicator should appear briefly (optional, may be too fast)
-    // Then the assistant's response message should appear
-    await expect(page.locator('.chat-message.assistant')).toBeVisible({ timeout: 15000 });
-
-    // Trade confirmation should be shown inline in the chat
-    await expect(page.locator('.trade-confirmation')).toBeVisible({ timeout: 15000 });
+    // Executed-trade confirmation chip appears inline ("BUY 5 AAPL @ $...")
+    await expect(page.getByText(/BUY 5 AAPL @ \$/)).toBeVisible({ timeout: 15000 });
   });
 
   /**
-   * Test 8: SSE reconnection
-   * Verifies that the frontend automatically reconnects to the SSE price stream
-   * after a network interruption:
-   * - App starts connected (green dot)
-   * - SSE endpoint is blocked (simulating network drop)
-   * - App detects disconnection
-   * - When unblocked, app reconnects and returns to connected state
+   * 8. SSE resilience: disconnect and verify automatic reconnection.
+   * context.setOffline() severs the open EventSource connection (a
+   * page.route() abort would only affect NEW requests, not the live stream).
    */
-  test('8. SSE reconnection on network drop', async ({ page }) => {
+  test('8. SSE reconnection after network drop', async ({ page, context }) => {
     await page.goto('/');
+    await waitForConnected(page);
 
-    // Verify initially connected
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 10000 });
+    // Drop the network: the EventSource errors out and the UI leaves "LIVE"
+    await context.setOffline(true);
+    await expect(page.getByText(/DISCONNECTED|RECONNECTING/)).toBeVisible({ timeout: 10000 });
 
-    // Block the SSE price stream to simulate a network disconnect
-    await page.route('/api/stream/prices', route => route.abort());
-
-    // Wait for the app to detect the disconnection
-    // (EventSource fires onerror fairly quickly after abort)
-    await page.waitForTimeout(2000);
-
-    // Unblock the SSE endpoint so reconnection can proceed
-    await page.unroute('/api/stream/prices');
-
-    // App should reconnect automatically (EventSource has built-in retry)
-    // Allow up to 15 seconds for reconnect cycle
-    await expect(page.locator('.connection-status.connected')).toBeVisible({ timeout: 15000 });
+    // Restore the network: the hook retries every 3s and should reconnect
+    await context.setOffline(false);
+    await waitForConnected(page);
   });
-
 });

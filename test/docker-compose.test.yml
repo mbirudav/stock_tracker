@@ -5,7 +5,8 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      # Host port 8001 -> container 8000 (host 8000 may be in use by other apps)
+      - "8001:8000"
     volumes:
       - ./test-db:/app/db
     environment:
